@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""git-map — render repos under one or more roots as a subway-style map (SVG).
+
+Lines  = git accounts (gh / gh:first8 / bitbucket / other)
+Spines = folder hierarchy under the root
+Station= a repository
+Fill   = status (clean / dirty / unpushed / no-remote)
+Rings  = interchange = repo that exists as copies in several places
+
+Usage:
+  git-map                       # scans ~/git -> ~/Pictures/git-map.svg
+  git-map ~/git ~/work          # scan given roots
+  git-map --out /tmp/m.svg ~/git
+Read-only; never writes to any repo.
+"""
+import os, sys, html
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from git_repo_scan import scan, build_tree, sorted_children, Node
+
+# ---- account -> colour (the "lines") ------------------------------------
+ACCOUNT_COLOR = {
+    "gh":        "#2563eb",   # personal github   – blue
+    "gh:first8": "#0d9488",   # work github       – teal
+    "bitbucket": "#7c3aed",   # bitbucket         – purple
+    "other":     "#64748b",   # any other remote  – slate
+    "none":      "#94a3b8",   # no remote         – grey
+}
+STATUS_FILL = {
+    "clean":     "#ffffff",
+    "dirty":     "#f59e0b",   # amber
+    "unpushed":  "#ef4444",   # red
+    "no-remote": "#e2e8f0",   # pale grey (also dashed stroke)
+}
+FOLDER = "#cbd5e1"
+
+COL, ROW = 26, 20
+PAD_L, PAD_T = 34, 84
+CHARW = 7.0          # approx monospace char width at 12px
+
+def main():
+    args = sys.argv[1:]
+    out = os.path.expanduser("~/Pictures/git-map.svg")
+    roots = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--out":
+            out = args[i + 1]; i += 2; continue
+        if a in ("-h", "--help"):
+            print(__doc__); return
+        roots.append(a); i += 1
+    if not roots:
+        roots = [os.path.expanduser("~/git")]
+
+    roots, repos, info, gid, n = scan(roots)
+    root_node = build_tree(roots, repos)
+
+    # pre-order layout: one row per node, x by depth
+    order = []
+    def dfs(node, depth):
+        node.x = PAD_L + depth * COL
+        node.y = PAD_T + len(order) * ROW
+        order.append(node)
+        for c in sorted_children(node):
+            dfs(c, depth + 1)
+    # top-level: render each root's children, skip synthetic "repos" root row
+    root_node.x = PAD_L - COL; root_node.y = PAD_T - ROW
+    for c in sorted(root_node.children.values(), key=lambda c: c.name.lower()):
+        dfs(c, 0)
+
+    if not order:
+        print("No repos found under: " + " ".join(roots)); return
+
+    max_x = max(n.x for n in order)
+    max_label = 0
+    for nd in order:
+        label = nd.name + ("  " if nd.repo else "/")
+        extra = 0
+        if nd.repo:
+            inf = info[nd.repo]
+            extra = len(inf["branch"]) + 24
+        max_label = max(max_label, nd.x + 14 + (len(label) + extra) * CHARW)
+    width = int(max(max_label, max_x + 360)) + 40
+    legend_y = order[-1].y + 46
+    height = int(legend_y + 150)
+
+    # ---- emit SVG -------------------------------------------------------
+    S = []
+    S.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+             f'height="{height}" font-family="monospace" font-size="12">')
+    S.append(f'<rect width="{width}" height="{height}" fill="#0f172a"/>')
+    S.append(f'<text x="{PAD_L}" y="34" fill="#f1f5f9" font-size="22" '
+             f'font-weight="bold">Repository map</text>')
+    S.append(f'<text x="{PAD_L}" y="54" fill="#94a3b8" font-size="12">'
+             f'{html.escape(" · ".join(roots))} — {len(repos)} repos</text>')
+
+    # spines (grey verticals) + coloured taps to each child
+    for nd in order:
+        kids = list(nd.children.values())
+        if not kids:
+            continue
+        ys = [c.y for c in kids]
+        S.append(f'<line x1="{nd.x}" y1="{nd.y}" x2="{nd.x}" y2="{max(ys)}" '
+                 f'stroke="{FOLDER}" stroke-width="2"/>')
+        for c in kids:
+            col = ACCOUNT_COLOR[info[c.repo]["account"]] if c.repo else FOLDER
+            S.append(f'<line x1="{nd.x}" y1="{c.y}" x2="{c.x}" y2="{c.y}" '
+                     f'stroke="{col}" stroke-width="2.5"/>')
+
+    # stations + labels
+    for nd in order:
+        if nd.repo:
+            inf = info[nd.repo]
+            acol = ACCOUNT_COLOR[inf["account"]]
+            fill = STATUS_FILL[inf["status"]]
+            dash = ' stroke-dasharray="2 2"' if inf["status"] == "no-remote" else ""
+            if nd.repo in gid:   # interchange = double ring
+                S.append(f'<circle cx="{nd.x}" cy="{nd.y}" r="8" fill="none" '
+                         f'stroke="{acol}" stroke-width="2"/>')
+            S.append(f'<circle cx="{nd.x}" cy="{nd.y}" r="5" fill="{fill}" '
+                     f'stroke="{acol}" stroke-width="2.5"{dash}/>')
+            # label + badges
+            tx = nd.x + 14
+            S.append(f'<text x="{tx}" y="{nd.y+4}" fill="#e2e8f0">'
+                     f'{html.escape(nd.name)}</text>')
+            bx = tx + (len(nd.name) + 1) * CHARW
+            S.append(f'<text x="{bx}" y="{nd.y+4}" fill="#64748b">'
+                     f'{html.escape(inf["branch"])}</text>')
+            bx += (len(inf["branch"]) + 1) * CHARW
+            badges = []
+            if inf["dirty"]:            badges.append(("±%d" % inf["dirty"], "#f59e0b"))
+            if inf["ahead"]:            badges.append(("↑%d" % inf["ahead"], "#ef4444"))
+            if not inf["has_up"] and inf["status"] != "no-remote":
+                badges.append(("no-upstream", "#fbbf24"))
+            if inf["status"] == "no-remote": badges.append(("no-remote", "#94a3b8"))
+            if nd.repo in gid:          badges.append(("⇄%d" % gid[nd.repo], "#a78bfa"))
+            for txt, c in badges:
+                S.append(f'<text x="{bx}" y="{nd.y+4}" fill="{c}">{txt}</text>')
+                bx += (len(txt) + 1) * CHARW
+        else:
+            S.append(f'<rect x="{nd.x-3}" y="{nd.y-3}" width="6" height="6" '
+                     f'fill="{FOLDER}"/>')
+            S.append(f'<text x="{nd.x+12}" y="{nd.y+4}" fill="#cbd5e1" '
+                     f'font-weight="bold">{html.escape(nd.name)}/</text>')
+
+    # legend
+    ly = legend_y
+    S.append(f'<text x="{PAD_L}" y="{ly}" fill="#f1f5f9" font-weight="bold">Legend</text>')
+    items = [
+        ("gh (personal)", ACCOUNT_COLOR["gh"], "ring"),
+        ("gh:first8 (work)", ACCOUNT_COLOR["gh:first8"], "ring"),
+        ("bitbucket", ACCOUNT_COLOR["bitbucket"], "ring"),
+        ("clean", STATUS_FILL["clean"], "fill"),
+        ("dirty (±N uncommitted)", STATUS_FILL["dirty"], "fill"),
+        ("unpushed (↑N / no-upstream)", STATUS_FILL["unpushed"], "fill"),
+        ("no-remote", STATUS_FILL["no-remote"], "fill"),
+        ("interchange = copies exist (⇄N)", "#a78bfa", "dring"),
+    ]
+    for k, (lbl, col, kind) in enumerate(items):
+        ix, iy = PAD_L + (k % 2) * 320, ly + 22 + (k // 2) * 24
+        if kind == "dring":
+            S.append(f'<circle cx="{ix}" cy="{iy-4}" r="8" fill="none" stroke="{col}" stroke-width="2"/>')
+            S.append(f'<circle cx="{ix}" cy="{iy-4}" r="5" fill="#fff" stroke="{col}" stroke-width="2.5"/>')
+        elif kind == "ring":
+            S.append(f'<circle cx="{ix}" cy="{iy-4}" r="5" fill="#0f172a" stroke="{col}" stroke-width="2.5"/>')
+        else:
+            S.append(f'<circle cx="{ix}" cy="{iy-4}" r="5" fill="{col}" stroke="#475569" stroke-width="1.5"/>')
+        S.append(f'<text x="{ix+14}" y="{iy}" fill="#cbd5e1">{html.escape(lbl)}</text>')
+
+    S.append("</svg>")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        f.write("\n".join(S))
+    print(f"wrote {out}  ({len(repos)} repos, {n} copy-groups)")
+    print(f"open with:  xdg-open {out}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""git-tui — interactive terminal map of your git repos (curses, no deps).
+
+Tree of repos under one or more roots, colour-coded by account, with
+status markers, copy/interchange tags, collapsible folders and filters.
+
+Usage:
+  git-tui                  # scan ~/git
+  git-tui ~/git ~/work     # scan given roots
+  git-tui --list           # non-interactive plain-text dump (no tty needed)
+
+Keys (interactive):
+  j / k  ↓ / ↑     move          g / G   top / bottom
+  l / →  expand    h / ←         collapse / jump to parent
+  Enter / Space    toggle folder
+  z                collapse-all / expand-all toggle
+  d                only dirty            u   only unpushed
+  x                only copies (⇄)       a   show all
+  c                jump to next copy (⇄) repo
+  r                rescan                 o   print selected repo path & quit
+  q                quit
+"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from git_repo_scan import scan, build_tree, sorted_children
+
+# status glyph + which curses colour pair carries the *account* colour
+GLYPH = {"clean": "○", "dirty": "●", "unpushed": "◆", "no-remote": "◌"}
+ACCOUNTS = {"gh": 1, "gh:first8": 2, "bitbucket": 3, "other": 4, "none": 7}
+
+
+def flatten(root, expanded, info, gid, predicate):
+    """Visible rows: list of (node, depth, is_folder). Honours collapse + filter.
+    A folder is shown only if it has a visible matching descendant."""
+    def matches(node):
+        if node.repo:
+            return predicate(node)
+        return any(matches(c) for c in node.children.values())
+
+    rows = []
+    def walk(node, depth):
+        for c in sorted_children(node):
+            if not matches(c):
+                continue
+            is_folder = c.repo is None
+            rows.append((c, depth, is_folder))
+            if is_folder and expanded.get(c.key, True):
+                walk(c, depth + 1)
+    walk(root, 0)
+    return rows
+
+
+def build():
+    roots, repos, info, gid, n = scan(ROOTS)
+    tree = build_tree(roots, repos)
+    return roots, repos, info, gid, n, tree
+
+
+# ---------- non-interactive dump -----------------------------------------
+def do_list():
+    roots, repos, info, gid, n, tree = build()
+    rows = flatten(tree, {}, info, gid, lambda nd: True)
+    print(f"# {' · '.join(roots)} — {len(repos)} repos, {n} copy-groups")
+    for nd, depth, is_folder in rows:
+        ind = "  " * depth
+        if is_folder:
+            print(f"{ind}{nd.name}/")
+        else:
+            inf = info[nd.repo]
+            badges = []
+            if inf["dirty"]:    badges.append(f"±{inf['dirty']}")
+            if inf["ahead"]:    badges.append(f"↑{inf['ahead']}")
+            if not inf["has_up"] and inf["status"] != "no-remote": badges.append("no-upstream")
+            if inf["status"] == "no-remote": badges.append("no-remote")
+            if nd.repo in gid:  badges.append(f"⇄{gid[nd.repo]}")
+            print(f"{ind}{GLYPH[inf['status']]} {nd.name}  [{inf['account']}] "
+                  f"{inf['branch']} {' '.join(badges)}".rstrip())
+
+
+# ---------- interactive curses -------------------------------------------
+def do_tui(stdscr):
+    import curses
+    curses.curs_set(0)
+    curses.use_default_colors()
+    pairs = {1: curses.COLOR_BLUE, 2: curses.COLOR_CYAN, 3: curses.COLOR_MAGENTA,
+             4: curses.COLOR_WHITE, 5: curses.COLOR_YELLOW, 6: curses.COLOR_RED,
+             7: curses.COLOR_GREEN}
+    for i, col in pairs.items():
+        curses.init_pair(i, col, -1)
+    DIM = curses.A_DIM
+    BOLD = curses.A_BOLD
+
+    roots, repos, info, gid, n, tree = build()
+    expanded = {}                      # key -> bool (default True)
+    filt = {"mode": "all"}
+    sel = 0
+    top = 0
+    legend_on = True
+
+    def predicate(nd):
+        m = filt["mode"]
+        if m == "all":      return True
+        inf = info[nd.repo]
+        if m == "dirty":    return inf["status"] == "dirty"
+        if m == "unpushed": return inf["status"] == "unpushed"
+        if m == "copies":   return nd.repo in gid
+        return True
+
+    def detail_view(repo):
+        """Drill-down: parallel per-branch timelines + selected branch's commits."""
+        from git_repo_scan import repo_detail
+        import time as _time
+        data = repo_detail(repo)
+        brs = data["branches"]
+        acc = curses.color_pair(ACCOUNTS.get(info.get(repo, {}).get("account", "other"), 4))
+        allct = [c["ct"] for b in brs for c in b["commits"] if c["ct"] > 0]
+        tmin, tmax = (min(allct), max(allct)) if allct else (0, 0)
+        span = max(1, tmax - tmin)
+        bsel = next((i for i, b in enumerate(brs) if b["current"]), 0)
+        coff = 0
+        d_legend = True
+        NAMEW = 22
+
+        # legend rows: (swatch, colour-pair, attr, text)
+        legend = [
+            ("•", None, 0, "pushed commit"),         # None -> account colour
+            ("◆", 6, BOLD, "unpushed commit"),
+            ("[ref]", 3, 0, "branch/tag at commit"),
+            ("*", 5, BOLD, "current branch"),
+            ("", 0, 0, ""),
+            ("↑↓", 6, 0, "ahead / behind upstream"),
+            ("±N", 5, 0, "uncommitted (working tree)"),
+        ]
+
+        while True:
+            h, w = stdscr.getmaxyx()
+            def put(y, x, s, attr=0, right=None):
+                rb = (w - 1) if right is None else right
+                nn = rb - x
+                if nn <= 0 or y < 0 or y >= h:
+                    return
+                try: stdscr.addnstr(y, x, str(s), nn, attr)
+                except curses.error: pass
+
+            bsel = max(0, min(bsel, len(brs) - 1)) if brs else 0
+            stdscr.erase()
+
+            # legend geometry (top-right)
+            SWW = 5
+            text_w = max((len(t) for *_, t in legend), default=10)
+            boxw = 2 + SWW + 1 + text_w + 2
+            boxh = len(legend) + 2
+            lx = w - boxw - 1
+            show_leg = d_legend and lx > 30 and boxh < h - 1
+            clip_y = boxh if show_leg else 0
+            def rbound(y):
+                return (lx - 1) if (show_leg and y < clip_y) else (w - 1)
+
+            inf = info.get(repo, {})
+            put(0, 0, (" " + repo).ljust(w), BOLD, right=rbound(0))
+            dirty = inf.get("dirty", 0)
+            put(1, 0, (f" working tree: {dirty} uncommitted change(s)" if dirty
+                       else " working tree: clean"),
+                curses.color_pair(5) if dirty else curses.color_pair(7), right=rbound(1))
+
+            lane_x = 2 + NAMEW + 1
+            y = 3
+            put(y, 0, f"Branches in parallel  (j/k to hop · {data['n_unpushed']} unpushed)",
+                BOLD | curses.color_pair(7), right=rbound(y)); y += 1
+
+            # one swim-lane per branch
+            lane_rows = []
+            for bi, b in enumerate(brs):
+                if y >= h - 6:        # leave room for axis + commit list
+                    break
+                lane_rows.append((bi, y))
+                sel = (bi == bsel)
+                rb = rbound(y)
+                rowattr = curses.A_REVERSE if sel else 0
+                put(y, 0, " " * w, rowattr, right=rb)
+                put(y, 0, "*" if b["current"] else " ", rowattr | BOLD | curses.color_pair(5))
+                nm = b["name"][:NAMEW - 1]
+                put(y, 2, f"{nm:<{NAMEW-1}}",
+                    rowattr | BOLD | (curses.color_pair(2) if (sel or b["current"]) else curses.color_pair(4)))
+                lw = rb - lane_x
+                if lw > 4 and allct:
+                    put(y, lane_x, "─" * lw, rowattr | DIM)
+                    for c in b["commits"]:
+                        if c["ct"] <= 0: continue
+                        gx = lane_x + int((c["ct"] - tmin) / span * (lw - 1))
+                        if not c["pushed"]:
+                            put(y, gx, "◆", rowattr | curses.color_pair(6) | BOLD)
+                        else:
+                            put(y, gx, "•", rowattr | (acc if sel else curses.color_pair(4)))
+                y += 1
+            # shared time axis
+            if allct:
+                rb = rbound(y); lw = rb - lane_x
+                put(y, lane_x, _time.strftime("%Y-%m", _time.localtime(tmin)), DIM)
+                rt = _time.strftime("%Y-%m", _time.localtime(tmax)) + "  now"
+                put(y, lane_x + lw - len(rt), rt, DIM, right=rb)
+            y += 2
+
+            # legend box (drawn on top of clipped rows)
+            if show_leg:
+                cp7 = curses.color_pair(7)
+                put(0, lx, "┌─ Legend " + "─" * (boxw - 11) + "┐", cp7, right=w)
+                for i, (sw, cp, ex, desc) in enumerate(legend):
+                    yy = 1 + i
+                    put(yy, lx, "│", cp7, right=w)
+                    put(yy, lx + boxw - 1, "│", cp7, right=w)
+                    if sw or desc:
+                        swatt = (acc if cp is None else (curses.color_pair(cp) | ex)) if (cp is None or cp) else DIM
+                        put(yy, lx + 2, f"{sw:<{SWW}}", swatt, right=w)
+                        put(yy, lx + 2 + SWW + 1, desc, DIM, right=w)
+                put(boxh - 1, lx, "└" + "─" * (boxw - 2) + "┘", cp7, right=w)
+
+            # selected branch's commit list
+            b = brs[bsel] if brs else None
+            if b:
+                if b["upstream"]:
+                    stat = f"↑{b['ahead']} ↓{b['behind']} vs {b['upstream']}"
+                    sc = 6 if (b["ahead"] or 0) > 0 else 7
+                else:
+                    u = b["unpushed"] or 0
+                    stat = f"no upstream — {u} local-only commit(s)"
+                    sc = 6 if u > 0 else 4
+                put(y, 0, f"Commits on ", BOLD | curses.color_pair(7))
+                put(y, 11, b["name"], BOLD | curses.color_pair(2))
+                put(y, 11 + len(b["name"]) + 2, stat, curses.color_pair(sc))
+                y += 1
+            list_top = y
+            avail = max(0, h - 1 - list_top)
+            cl = b["commits"] if b else []
+            coff = max(0, min(coff, max(0, len(cl) - avail)))
+            for i in range(avail):
+                ci = coff + i
+                if ci >= len(cl): break
+                c = cl[ci]; yy = list_top + i
+                up = not c["pushed"]
+                put(yy, 1, "◆" if up else "·",
+                    curses.color_pair(6) | BOLD if up else curses.color_pair(4))
+                put(yy, 3, c["sha"], curses.color_pair(4))
+                put(yy, 12, f"{c['rel']:<16}", DIM)
+                cx = 29
+                if c["refs"]:
+                    rr = c["refs"].replace("HEAD -> ", "@")
+                    put(yy, cx, f"[{rr}]", curses.color_pair(3))
+                    cx += len(rr) + 3
+                put(yy, cx, c["subj"], curses.color_pair(6) if up else 0)
+
+            put(h - 1, 0, (" j/k hop branch  PgUp/PgDn scroll  g/G top/bottom  "
+                           "? legend  h/←/q back").ljust(w), DIM)
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("h"), curses.KEY_LEFT, 27): return
+            elif ch in (ord("j"), curses.KEY_DOWN):  bsel = min(len(brs) - 1, bsel + 1); coff = 0
+            elif ch in (ord("k"), curses.KEY_UP):    bsel = max(0, bsel - 1); coff = 0
+            elif ch == curses.KEY_NPAGE:             coff += avail
+            elif ch == curses.KEY_PPAGE:             coff = max(0, coff - avail)
+            elif ch == ord("g"):                     coff = 0
+            elif ch == ord("G"):                     coff = max(0, len(cl) - avail)
+            elif ch == ord("?"):                     d_legend = not d_legend
+
+    while True:
+        rows = flatten(tree, expanded, info, gid, predicate)
+        if not rows:
+            rows = []
+        sel = max(0, min(sel, len(rows) - 1)) if rows else 0
+        h, w = stdscr.getmaxyx()
+        body = h - 3
+        def put(y, x, s, attr=0, right=None):
+            rb = (w - 1) if right is None else right   # never touch bottom-right cell
+            nn = rb - x
+            if nn <= 0 or y < 0 or y >= h:
+                return
+            try:
+                stdscr.addnstr(y, x, str(s), nn, attr)
+            except curses.error:
+                pass
+        if sel < top:        top = sel
+        if sel >= top + body: top = sel - body + 1
+        top = max(0, top)
+
+        stdscr.erase()
+
+        # ----- legend geometry (top-right box) -----
+        # (swatch, colour-pair, attr-extra, description)
+        legend = [
+            ("●", 1, BOLD, "personal github"),
+            ("●", 2, BOLD, "first8 (work)"),
+            ("●", 3, BOLD, "bitbucket"),
+            ("●", 4, BOLD, "other remote"),
+            ("",  0, 0,    ""),
+            ("●", 4, BOLD, "filled = dirty (uncommitted)"),
+            ("○", 4, BOLD, "open = clean & pushed"),
+            ("◆", 4, BOLD, "unpushed commits"),
+            ("◌", 4, BOLD, "no remote configured"),
+            ("",  0, 0,    ""),
+            ("ab", 4, DIM, "dim text = branch name"),
+            ("±N", 5, 0,   "N files changed (dirty)"),
+            ("↑N", 6, 0,   "N commits unpushed"),
+            ("no-up", 5, 0, "no upstream branch set"),
+            ("⇄N", 3, 0,   "copy group N (exists elsewhere)"),
+        ]
+        SWW = 5                                   # swatch column width
+        text_w = max(len(t) for _, _, _, t in legend)
+        boxw = 2 + SWW + 1 + text_w + 2           # borders + swatch + gap + text + pad
+        boxh = len(legend) + 2
+        lx = w - boxw - 1
+        show_legend = legend_on and lx > 24 and boxh < h - 1
+        clip_y = boxh if show_legend else 0       # rows above this get clipped on the right
+
+        nd_dirty = sum(1 for p in repos if info[p]["status"] == "dirty")
+        nd_unp = sum(1 for p in repos if info[p]["status"] == "unpushed")
+        header = (f" git-tui  {len(repos)} repos  "
+                  f"{nd_dirty} dirty  {nd_unp} unpushed  {n} copy-groups"
+                  f"   [filter: {filt['mode']}]")
+        put(0, 0, header.ljust(w), BOLD,
+            right=(lx - 1) if (show_legend and clip_y > 0) else None)
+
+        for i in range(body):
+            ri = top + i
+            if ri >= len(rows):
+                break
+            nd, depth, is_folder = rows[ri]
+            y = 1 + i
+            rb = (lx - 1) if (show_legend and y < clip_y) else (w - 1)
+            cur = (ri == sel)
+            attr = curses.A_REVERSE if cur else 0
+            x = 1 + depth * 2
+            put(y, 0, " " * w, attr, right=rb)             # paint row background
+            if is_folder:
+                arrow = "▾" if expanded.get(nd.key, True) else "▸"
+                put(y, x, f"{arrow} {nd.name}/", attr | curses.color_pair(7) | DIM, right=rb)
+            else:
+                inf = info[nd.repo]
+                acc = curses.color_pair(ACCOUNTS.get(inf["account"], 4))
+                put(y, x, GLYPH[inf["status"]], attr | acc | BOLD, right=rb)  # glyph = account colour
+                cx = x + 2
+                put(y, cx, nd.name, attr | acc, right=rb)
+                cx += len(nd.name) + 1
+                put(y, cx, inf["branch"], attr | DIM, right=rb)
+                cx += len(inf["branch"]) + 1
+                badges = []
+                if inf["dirty"]:    badges.append((f"±{inf['dirty']}", 5))
+                if inf["ahead"]:    badges.append((f"↑{inf['ahead']}", 6))
+                if not inf["has_up"] and inf["status"] != "no-remote":
+                    badges.append(("no-up", 5))
+                if inf["status"] == "no-remote": badges.append(("no-remote", 7))
+                if nd.repo in gid:  badges.append((f"⇄{gid[nd.repo]}", 3))
+                for txt, cp in badges:
+                    if cx >= rb: break
+                    put(y, cx, txt, attr | curses.color_pair(cp), right=rb)
+                    cx += len(txt) + 1
+
+        # ----- draw legend box on top -----
+        if show_legend:
+            put(0, lx, "┌" + "─" * (boxw - 2) + "┐", curses.color_pair(7), right=w)
+            put(0, lx + 2, " Legend ", curses.color_pair(7) | BOLD, right=w)
+            for i, (sw, cp, ex, desc) in enumerate(legend):
+                y = 1 + i
+                put(y, lx, "│", curses.color_pair(7), right=w)
+                put(y, lx + boxw - 1, "│", curses.color_pair(7), right=w)
+                if sw or desc:
+                    put(y, lx + 2, f"{sw:<{SWW}}",
+                        (curses.color_pair(cp) | ex) if cp else DIM, right=w)
+                    put(y, lx + 2 + SWW + 1, desc, DIM, right=w)
+            put(boxh - 1, lx, "└" + "─" * (boxw - 2) + "┘", curses.color_pair(7), right=w)
+
+        foot = (" j/k move  l/h fold  z all  d dirty u unpushed x copies a all  "
+                "c next-copy  ? legend  r rescan  o cd  q quit")
+        put(h - 1, 0, foot.ljust(w), DIM)
+        if rows:
+            put(h - 2, 0, (" " + path_of(rows[sel][0])).ljust(w), DIM)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27):
+            return None
+        elif ch in (ord("j"), curses.KEY_DOWN):  sel += 1
+        elif ch in (ord("k"), curses.KEY_UP):    sel -= 1
+        elif ch == ord("g"):                     sel = 0
+        elif ch == ord("G"):                     sel = len(rows) - 1
+        elif ch in (curses.KEY_NPAGE,):          sel += body
+        elif ch in (curses.KEY_PPAGE,):          sel -= body
+        elif ch in (ord("l"), curses.KEY_RIGHT):
+            nd = rows[sel][0]
+            if nd.repo is None: expanded[nd.key] = True
+            else:               detail_view(nd.repo)
+        elif ch in (ord("h"), curses.KEY_LEFT):
+            nd, depth, is_folder = rows[sel]
+            if is_folder and expanded.get(nd.key, True):
+                expanded[nd.key] = False
+            else:                                # jump to parent folder row
+                for ri in range(sel - 1, -1, -1):
+                    if rows[ri][1] < depth:
+                        sel = ri; break
+        elif ch in (ord("\n"), ord(" ")):
+            nd = rows[sel][0]
+            if nd.repo is None:
+                expanded[nd.key] = not expanded.get(nd.key, True)
+            else:
+                detail_view(nd.repo)
+        elif ch == ord("z"):
+            allkeys = collect_folders(tree)
+            if any(expanded.get(k, True) for k in allkeys):
+                for k in allkeys: expanded[k] = False
+            else:
+                for k in allkeys: expanded[k] = True
+        elif ch == ord("?"): legend_on = not legend_on
+        elif ch == ord("d"): filt["mode"] = "dirty"
+        elif ch == ord("u"): filt["mode"] = "unpushed"
+        elif ch == ord("x"): filt["mode"] = "copies"
+        elif ch == ord("a"): filt["mode"] = "all"
+        elif ch == ord("c"):
+            for off in range(1, len(rows) + 1):
+                ri = (sel + off) % len(rows)
+                nd = rows[ri][0]
+                if nd.repo in gid:
+                    sel = ri; break
+        elif ch == ord("r"):
+            roots, repos, info, gid, n, tree = build()
+        elif ch == ord("o"):
+            nd = rows[sel][0]
+            return nd.repo if nd.repo else None
+
+
+def path_of(nd):
+    return nd.repo if nd.repo else nd.key
+
+
+def collect_folders(tree):
+    keys = []
+    def walk(n):
+        for c in n.children.values():
+            if c.repo is None:
+                keys.append(c.key); walk(c)
+    walk(tree)
+    return keys
+
+
+ROOTS = []
+
+def main():
+    global ROOTS
+    args = [a for a in sys.argv[1:]]
+    list_mode = "--list" in args
+    if "-h" in args or "--help" in args:
+        print(__doc__); return
+    ROOTS = [a for a in args if not a.startswith("-")] or [os.path.expanduser("~/git")]
+    if list_mode:
+        do_list(); return
+    if not sys.stdout.isatty():
+        sys.stderr.write("git-tui: not a tty; use --list for plain output\n")
+        do_list(); return
+    import curses
+    sel_path = curses.wrapper(do_tui)
+    if sel_path:        # 'o' -> emit path so you can:  cd "$(git-tui)"
+        print(sel_path)
+
+
+if __name__ == "__main__":
+    main()

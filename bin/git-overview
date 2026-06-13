@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# git-overview — read-only survey of git repos under one or more roots.
+# Shows: branch, dirty state, ahead/behind upstream, remote host (which account),
+# and flags repos that need attention (uncommitted, unpushed, or no remote).
+#
+# Usage:
+#   git-overview                 # scans ~/git
+#   git-overview ~/git ~/work    # scans the given roots
+#   git-overview --all           # also clean repos in the detailed list
+#   git-overview --copies        # group repo copies; which are safe to delete
+#
+# Read-only: never writes to any repo.
+
+set -uo pipefail
+
+# ---- options -------------------------------------------------------------
+SHOW_ALL=0
+COPIES=0
+ROOTS=()
+for a in "$@"; do
+  case "$a" in
+    --all) SHOW_ALL=1 ;;
+    --copies|--dups) COPIES=1 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) ROOTS+=("$a") ;;
+  esac
+done
+[ ${#ROOTS[@]} -eq 0 ] && ROOTS=("$HOME/git")
+
+# ---- colors (disabled if not a tty) -------------------------------------
+if [ -t 1 ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; Z=$'\e[0m'
+else
+  R=; G=; Y=; B=; DIM=; BOLD=; Z=
+fi
+
+# ---- find repos ----------------------------------------------------------
+# Match .git as dir (normal repo) or file (linked worktree). Prune heavy trees.
+declare -A SEEN=()
+REPOS=()
+for root in "${ROOTS[@]}"; do
+  [ -d "$root" ] || { printf '%sskip (no such dir): %s%s\n' "$DIM" "$root" "$Z" >&2; continue; }
+  while IFS= read -r gitpath; do
+    repo=$(dirname "$gitpath")
+    # canonicalize to dedupe
+    repo=$(cd "$repo" 2>/dev/null && pwd) || continue
+    [ -n "${SEEN[$repo]:-}" ] && continue
+    SEEN[$repo]=1
+    REPOS+=("$repo")
+  done < <(find "$root" \( -name node_modules -o -name .cache -o -name .direnv \) -prune \
+             -o -name .git -print 2>/dev/null)
+done
+
+if [ ${#REPOS[@]} -eq 0 ]; then
+  echo "No git repos found under: ${ROOTS[*]}"
+  exit 0
+fi
+
+# Mark nested repos (submodules / vendored libs living inside another repo).
+declare -A NESTED=()
+for r in "${REPOS[@]}"; do
+  for r2 in "${REPOS[@]}"; do
+    [ "$r" = "$r2" ] && continue
+    case "$r" in "$r2"/*) NESTED[$r]=1; break;; esac
+  done
+done
+
+# ---- inspect each repo ---------------------------------------------------
+# Build two lists: attention[] and clean[], each as preformatted lines.
+attention=()
+clean=()
+n_dirty=0; n_unpushed=0; n_noremote=0
+
+host_of() {  # short label for the remote host / account
+  local url="$1"
+  case "$url" in
+    *github-first8:*|*github-first8/*) echo "gh:first8" ;;
+    *bitbucket.org*)                    echo "bitbucket" ;;
+    *github.com*|*github.com:*)         echo "gh" ;;
+    "")                                 echo "-" ;;
+    *)                                  echo "${url%%:*}" ;;
+  esac
+}
+
+# ==========================================================================
+# --copies mode: find repos that are copies of each other and judge each copy.
+# ==========================================================================
+if [ "$COPIES" -eq 1 ]; then
+  declare -A GROUP=()
+  for d in "${REPOS[@]}"; do
+    [ -n "${NESTED[$d]:-}" ] && continue                 # ignore submodules/vendored
+    key=$(git -C "$d" remote get-url origin 2>/dev/null)
+    if [ -z "$key" ]; then                               # no remote -> group by root commit(s)
+      roots=$(git -C "$d" rev-list --max-parents=0 HEAD 2>/dev/null | sort | tr '\n' ',')
+      key="root:${roots:-none}"
+    fi
+    GROUP["$key"]+="$d"$'\n'
+  done
+
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  ngroups=0
+
+  printf '\n%sgit-overview --copies%s  —  repos sharing an origin / root commit\n' "$BOLD" "$Z"
+
+  for key in "${!GROUP[@]}"; do
+    mapfile -t members < <(printf '%s' "${GROUP[$key]}")
+    [ ${#members[@]} -lt 2 ] && continue                 # only groups with 2+ copies
+    ngroups=$((ngroups+1))
+
+    # Build the global "pushed" set (commits on a remote in ANY copy) and per-copy local sets.
+    : > "$tmp/pushed_all"
+    i=0
+    for m in "${members[@]}"; do
+      git -C "$m" rev-list --branches 2>/dev/null | sort -u > "$tmp/local.$i"
+      git -C "$m" rev-list --remotes 2>/dev/null | sort -u >> "$tmp/pushed_all"
+      i=$((i+1))
+    done
+    sort -u "$tmp/pushed_all" -o "$tmp/pushed_all"
+
+    printf '\n%s● %s%s  (%d copies)\n' "$BOLD" "$key" "$Z" "${#members[@]}"
+
+    # ---- pass 1: gather per-copy facts + a state signature ----
+    m_rel=(); m_branch=(); m_head=(); m_dirty=(); m_uniq=(); m_state=()
+    declare -A STATE_FIRST=()   # state-sig -> rel of first copy seen with it
+    statenum=0
+    i=0
+    for m in "${members[@]}"; do
+      : > "$tmp/others"
+      j=0
+      for _ in "${members[@]}"; do
+        [ "$j" -ne "$i" ] && cat "$tmp/local.$j" >> "$tmp/others"
+        j=$((j+1))
+      done
+      sort -u "$tmp/others" -o "$tmp/others"
+      cat "$tmp/pushed_all" "$tmp/others" | sort -u > "$tmp/elsewhere"
+
+      uniq_unpushed=$(comm -23 "$tmp/local.$i" "$tmp/elsewhere" | wc -l | tr -d ' ')
+      dirty=$(git -C "$m" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      branch=$(git -C "$m" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+      head=$(git -C "$m" rev-parse --short HEAD 2>/dev/null || echo '-')
+      rel=${m#"$HOME"/}
+
+      # state signature: HEAD + tracked diff + untracked file paths&sizes.
+      # (sizes, not contents, keep it fast; size differences => treated as distinct = the safe side)
+      sig=$( { git -C "$m" rev-parse HEAD 2>/dev/null
+               git -C "$m" -c core.fileMode=false diff HEAD 2>/dev/null
+               ( cd "$m" 2>/dev/null && git ls-files --others --exclude-standard -z \
+                   | xargs -0 -r stat -c '%n %s' 2>/dev/null | sort )
+             } | sha1sum | cut -c1-12 )
+
+      m_rel[$i]=$rel; m_branch[$i]=$branch; m_head[$i]=$head
+      m_dirty[$i]=$dirty; m_uniq[$i]=$uniq_unpushed; m_state[$i]=$sig
+      i=$((i+1))
+    done
+
+    # ---- assign short labels [A],[B],... to distinct states ----
+    declare -A STATE_LABEL=()
+    labels=(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z)
+    li=0
+    for s in "${m_state[@]}"; do
+      if [ -z "${STATE_LABEL[$s]:-}" ]; then STATE_LABEL[$s]=${labels[$li]:-?}; li=$((li+1)); fi
+    done
+
+    # ---- pass 2: print with verdicts ----
+    declare -A STATE_SEEN=()
+    i=0
+    for _ in "${members[@]}"; do
+      rel=${m_rel[$i]}; branch=${m_branch[$i]}; head=${m_head[$i]}
+      dirty=${m_dirty[$i]}; uniq_unpushed=${m_uniq[$i]}; sig=${m_state[$i]}
+      lbl=${STATE_LABEL[$sig]}
+
+      if [ "$uniq_unpushed" -eq 0 ] && [ "$dirty" -eq 0 ]; then
+        verdict="${G}SAFE TO DELETE${Z}"
+      elif [ -n "${STATE_SEEN[$sig]:-}" ]; then
+        verdict="${G}SAFE TO DELETE — identical to ${STATE_SEEN[$sig]}${Z}"
+      elif [ "$uniq_unpushed" -gt 0 ]; then
+        verdict="${R}KEEP — ${uniq_unpushed} unique unpushed commit(s)${Z}"
+      else
+        verdict="${Y}KEEP — distinct snapshot, ${dirty} uncommitted change(s)${Z}"
+      fi
+      [ -z "${STATE_SEEN[$sig]:-}" ] && STATE_SEEN[$sig]=$rel
+
+      dstr="   "; [ "$dirty" -gt 0 ] && dstr="${Y}±${dirty}${Z}"
+      printf '   %s[%s]%s %s%-44s%s %s%-22s%s %s%s%s %s  %s\n' \
+        "$BOLD" "$lbl" "$Z" "$BOLD" "$rel" "$Z" "$DIM" "$branch" "$Z" \
+        "$DIM" "$head" "$Z" "$dstr" "$verdict"
+      i=$((i+1))
+    done
+  done
+
+  [ "$ngroups" -eq 0 ] && printf '\n%sNo copies found — every repo is unique.%s\n' "$G" "$Z"
+  printf '\n%slegend:%s a copy is SAFE TO DELETE only if it has no unique unpushed commits AND no uncommitted changes.\n\n' "$DIM" "$Z"
+  exit 0
+fi
+
+n_nested=0
+for d in "${REPOS[@]}"; do
+  if [ -n "${NESTED[$d]:-}" ] && [ "$SHOW_ALL" -eq 0 ]; then n_nested=$((n_nested+1)); continue; fi
+  branch=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="?"
+  [ "$branch" = "HEAD" ] && branch="(detached)"
+
+  # has any commit?
+  has_commit=1
+  git -C "$d" rev-parse HEAD >/dev/null 2>&1 || has_commit=0
+
+  # dirty
+  dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+  # remotes
+  remotes=$(git -C "$d" remote 2>/dev/null)
+  url=$(git -C "$d" remote get-url origin 2>/dev/null || echo "")
+  host=$(host_of "$url")
+
+  # ahead/behind upstream
+  ahead=0; behind=0; has_upstream=0
+  if up=$(git -C "$d" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+    has_upstream=1
+    if read -r behind ahead < <(git -C "$d" rev-list --count --left-right '@{upstream}...HEAD' 2>/dev/null); then :; fi
+  fi
+
+  last=$(git -C "$d" log -1 --format='%cr' 2>/dev/null || echo "-")
+  email=$(git -C "$d" config user.email 2>/dev/null || echo "-")
+
+  # ---- classify ----
+  flags=()
+  needs=0
+  if [ "$dirty" -gt 0 ]; then flags+=("${R}±${dirty} dirty${Z}"); needs=1; n_dirty=$((n_dirty+1)); fi
+  if [ -z "$remotes" ]; then
+    flags+=("${R}no-remote${Z}"); needs=1; n_noremote=$((n_noremote+1))
+  elif [ "$has_upstream" -eq 0 ] && [ "$has_commit" -eq 1 ]; then
+    flags+=("${Y}no-upstream${Z}"); needs=1; n_unpushed=$((n_unpushed+1))
+  elif [ "${ahead:-0}" -gt 0 ]; then
+    flags+=("${Y}↑${ahead} unpushed${Z}"); needs=1; n_unpushed=$((n_unpushed+1))
+  fi
+  [ "${behind:-0}" -gt 0 ] && flags+=("${B}↓${behind}${Z}")
+  [ "$has_commit" -eq 0 ] && flags+=("${DIM}no-commits${Z}")
+
+  rel=${d#"$HOME"/}
+  flagstr=""
+  [ ${#flags[@]} -gt 0 ] && flagstr=$(printf '%s ' "${flags[@]}")
+  line=$(printf '%s%-45s%s %s%-10s%s %s%-9s%s %s\n' \
+          "$BOLD" "$rel" "$Z" \
+          "$DIM" "$branch" "$Z" \
+          "$DIM" "$host" "$Z" \
+          "$flagstr")
+  if [ "$needs" -eq 1 ]; then attention+=("$line"); else clean+=("$line  ${DIM}${last}${Z}"); fi
+done
+
+# ---- output --------------------------------------------------------------
+printf '\n%sgit-overview%s  —  %d repos under %s\n' "$BOLD" "$Z" "${#REPOS[@]}" "${ROOTS[*]}"
+
+if [ ${#attention[@]} -gt 0 ]; then
+  printf '\n%sNEEDS ATTENTION%s (%d)\n' "$BOLD$R" "$Z" "${#attention[@]}"
+  printf '%s\n' "${attention[@]}"
+else
+  printf '\n%sAll repos committed & pushed.%s\n' "$G" "$Z"
+fi
+
+if [ "$SHOW_ALL" -eq 1 ] && [ ${#clean[@]} -gt 0 ]; then
+  printf '\n%sCLEAN%s (%d)\n' "$BOLD$G" "$Z" "${#clean[@]}"
+  printf '%s\n' "${clean[@]}"
+elif [ ${#clean[@]} -gt 0 ]; then
+  printf '\n%s%d clean repos hidden — pass --all to show them.%s\n' "$DIM" "${#clean[@]}" "$Z"
+fi
+
+printf '\n%ssummary:%s %s%d dirty%s, %s%d unpushed/no-upstream%s, %s%d no-remote%s' \
+  "$BOLD" "$Z" "$R" "$n_dirty" "$Z" "$Y" "$n_unpushed" "$Z" "$R" "$n_noremote" "$Z"
+[ "${n_nested:-0}" -gt 0 ] && printf ', %s%d nested/submodule hidden%s' "$DIM" "$n_nested" "$Z"
+printf '\n\n'
