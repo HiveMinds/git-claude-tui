@@ -136,12 +136,33 @@ def repo_graph(repo, limit=600):
             art, rest = ln.split(US, 1)
             f = (rest.split(US) + [""] * 5)[:5]
             h, ct, cr, refs, subj = f
-            out.append(dict(kind="c", art=art, sha=h[:8],
+            out.append(dict(kind="c", art=art, sha=h[:8], full=h,
                             ct=int(ct) if ct.isdigit() else 0, rel=cr,
                             refs=refs, subj=subj, pushed=(h in pushed)))
         elif ln.strip():
             out.append(dict(kind="l", art=ln))
     return out
+
+def repo_worktree(repo):
+    """Uncommitted state: staged / unstaged / untracked files, and the HEAD it sits on."""
+    cur = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    head = git(repo, "rev-parse", "HEAD")
+    subj = git(repo, "log", "-1", "--format=%s")
+    raw = git(repo, "status", "--porcelain=v1")
+    staged, unstaged, untracked, nfiles = [], [], [], 0
+    for ln in raw.split("\n"):
+        if len(ln) < 4:
+            continue
+        nfiles += 1                        # one porcelain line == one changed file
+        x, y, path = ln[0], ln[1], ln[3:]
+        if x == "?" and y == "?":
+            untracked.append(path); continue
+        if x not in " ?":
+            staged.append((x, path))       # in the index -> will be committed
+        if y not in " ?":
+            unstaged.append((y, path))     # modified in tree, not staged
+    return dict(branch=cur, head=head, head_short=head[:8], subj=subj,
+                staged=staged, unstaged=unstaged, untracked=untracked, n=nfiles)
 
 def repo_detail(repo, per_branch=400, max_branches=24, with_commits=True):
     """Branches (optionally each with its commit list) for the drill-down."""

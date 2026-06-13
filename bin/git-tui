@@ -108,15 +108,97 @@ def do_tui(stdscr):
 
     LANE = [2, 1, 3, 7, 5, 4]   # lane colours (cyan, blue, magenta, green, yellow, white)
 
+    def diff_view(repo):
+        """Scrollable diff of staged (git diff --cached) and unstaged (git diff)."""
+        from git_repo_scan import git as gitcmd
+        staged = gitcmd(repo, "diff", "--cached")
+        unstaged = gitcmd(repo, "diff")
+        rows = [("══ STAGED — git added, will be committed ══", curses.color_pair(7) | BOLD)]
+        rows += ([(l, None) for l in staged.split("\n")] if staged.strip()
+                 else [("  (nothing staged)", DIM)])
+        rows.append(("", 0))
+        rows.append(("══ UNSTAGED — modified but NOT git added ══", curses.color_pair(5) | BOLD))
+        rows += ([(l, None) for l in unstaged.split("\n")] if unstaged.strip()
+                 else [("  (nothing unstaged — if files are listed, they're all staged; "
+                        "plain `git diff` is empty)", DIM)])
+
+        def lcol(s):
+            if s[:3] in ("+++", "---"): return DIM | BOLD
+            if s[:2] == "@@":           return curses.color_pair(2)
+            if s[:1] == "+":            return curses.color_pair(7)
+            if s[:1] == "-":            return curses.color_pair(6)
+            if s.startswith(("diff ", "index ")): return DIM
+            return 0
+
+        coff = 0
+        while True:
+            h, w = stdscr.getmaxyx()
+            def put(y, x, s, attr=0):
+                if 0 <= y < h and 0 <= x < w - 1:
+                    try: stdscr.addnstr(y, x, str(s), w - 1 - x, attr)
+                    except curses.error: pass
+            stdscr.erase()
+            put(0, 0, (f" diff · {repo}").ljust(w), BOLD)
+            avail = max(0, h - 2)
+            coff = max(0, min(coff, max(0, len(rows) - avail)))
+            for i in range(avail):
+                ri = coff + i
+                if ri >= len(rows): break
+                text, attr = rows[ri]
+                if attr is None: attr = lcol(text)
+                put(1 + i, 0, text, attr)
+            put(h - 1, 0, " j/k scroll · PgUp/PgDn · g/G · q/h/← back".ljust(w), DIM)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("h"), curses.KEY_LEFT, 27): return
+            elif ch in (ord("j"), curses.KEY_DOWN): coff += 1
+            elif ch in (ord("k"), curses.KEY_UP):   coff = max(0, coff - 1)
+            elif ch == curses.KEY_NPAGE:            coff += avail
+            elif ch == curses.KEY_PPAGE:            coff = max(0, coff - avail)
+            elif ch == ord("g"):                    coff = 0
+            elif ch == ord("G"):                    coff = max(0, len(rows) - avail)
+
     def detail_view(repo):
         """Drill-down: the commit DAG (git topology) drawn as a coloured map."""
-        from git_repo_scan import repo_graph, repo_detail
+        from git_repo_scan import repo_graph, repo_detail, repo_worktree
         glines = repo_graph(repo)
         det = repo_detail(repo, with_commits=False)
         brs = det["branches"]
         nun = det["n_unpushed"]
         cur = next((b for b in brs if b["current"]), None)
         acc = curses.color_pair(ACCOUNTS.get(info.get(repo, {}).get("account", "other"), 4))
+
+        # working tree: inject a stub branching off HEAD that lists uncommitted files
+        wt = repo_worktree(repo)
+        if wt["n"]:
+            hidx = next((i for i, L in enumerate(glines)
+                         if L["kind"] == "c" and L.get("full") == wt["head"]), None)
+            if hidx is not None:
+                base_art = glines[hidx]["art"]; star = base_art.find("*")
+            else:
+                hidx, base_art, star = 0, "*", 0
+            if star < 0: star = 0
+            def bar(node):
+                a = list(base_art)
+                if star < len(a): a[star] = node
+                else: a += [" "] * (star - len(a)) + [node]
+                return "".join(a)
+            stub = [dict(kind="wt", art=bar("✎"),
+                         text=f"working tree · branch {wt['branch']} · {wt['n']} uncommitted, "
+                              f"on top of {wt['head_short']}   (press d to view diff)",
+                         attr=curses.color_pair(5) | BOLD)]
+            def add(items, tag, attr):
+                for it in items[:15]:
+                    p = it[1] if isinstance(it, tuple) else it
+                    stub.append(dict(kind="wt", art=bar("│"), text=f"{tag:<12}{p}", attr=attr))
+                if len(items) > 15:
+                    stub.append(dict(kind="wt", art=bar("│"),
+                                     text=f"{tag:<12}…(+{len(items)-15} more)", attr=attr))
+            add(wt["staged"],    "+ staged",    curses.color_pair(7))           # green: in index
+            add(wt["unstaged"],  "~ modified",  curses.color_pair(5))           # yellow: not staged
+            add(wt["untracked"], "? untracked", curses.color_pair(4) | DIM)     # new files
+            glines = glines[:hidx] + stub + glines[hidx:]
+
         maxart = min(30, max((len(L["art"]) for L in glines), default=2) + 1)
         coff = 0
         d_legend = True
@@ -126,8 +208,10 @@ def do_tui(stdscr):
             ("◆", 6, BOLD, "unpushed commit"),
             ("│╱╲", 2, 0, "branch lane / fork / merge"),
             ("[ref]", 3, 0, "branch or tag here"),
+            ("✎", 5, BOLD, "working tree (d: diff)"),
+            ("+~?", 7, 0, "staged / modified / new"),
             ("", 0, 0, ""),
-            ("±N", 5, 0, "uncommitted (working tree)"),
+            ("±N", 5, 0, "uncommitted, not in a commit"),
         ]
 
         while True:
@@ -155,9 +239,10 @@ def do_tui(stdscr):
             inf = info.get(repo, {})
             put(0, 0, (" " + repo).ljust(w), BOLD, right=rbound(0))
             dirty = inf.get("dirty", 0)
-            wt = (f" working tree: {dirty} uncommitted change(s)" if dirty
-                  else " working tree: clean")
-            put(1, 0, wt, curses.color_pair(5) if dirty else curses.color_pair(7),
+            wtline = (f" working tree: {wt['n']} uncommitted file(s) on branch "
+                      f"{wt['branch']} — see ✎ below (d = diff)" if wt["n"]
+                      else " working tree: clean (nothing uncommitted)")
+            put(1, 0, wtline, curses.color_pair(5) if wt["n"] else curses.color_pair(7),
                 right=rbound(1))
             if cur:
                 cb = (f"↑{cur['ahead']} ↓{cur['behind']} vs {cur['upstream']}"
@@ -204,11 +289,16 @@ def do_tui(stdscr):
                     if chc == "*":
                         put(y, gx, "●" if pushed else "◆",
                             acc if pushed else (curses.color_pair(6) | BOLD))
+                    elif chc == "✎":
+                        put(y, gx, "✎", curses.color_pair(5) | BOLD)
                     else:
                         put(y, gx, chc, curses.color_pair(LANE[(idx // 2) % len(LANE)]))
+                cx = ax + maxart
+                if L["kind"] == "wt":
+                    put(y, cx, L["text"], L.get("attr", 0), right=rb)
+                    continue
                 if L["kind"] != "c":
                     continue
-                cx = ax + maxart
                 put(y, cx, L["sha"], curses.color_pair(4), right=rb); cx += 9
                 put(y, cx, f"{L['rel']:<13}", DIM, right=rb); cx += 14
                 if L["refs"]:
@@ -218,11 +308,12 @@ def do_tui(stdscr):
                 put(y, cx, L["subj"], (curses.color_pair(6) if not pushed else 0), right=rb)
 
             put(h - 1, 0, (" j/k scroll  PgUp/PgDn page  g/G top/bottom  "
-                           "? legend  h/←/q back").ljust(w), DIM)
+                           "d diff  ? legend  h/←/q back").ljust(w), DIM)
             stdscr.refresh()
 
             ch = stdscr.getch()
             if ch in (ord("q"), ord("h"), curses.KEY_LEFT, 27): return
+            elif ch == ord("d") and wt["n"]:         diff_view(repo)
             elif ch in (ord("j"), curses.KEY_DOWN):  coff += 1
             elif ch in (ord("k"), curses.KEY_UP):    coff = max(0, coff - 1)
             elif ch == curses.KEY_NPAGE:             coff += avail
