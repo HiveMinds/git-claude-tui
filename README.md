@@ -18,7 +18,7 @@ them in the same directory.
 | `git-overview` | Survey every repo under given roots: branch, dirty count, ahead/behind, remote account, flags repos needing attention. |
 | `git-overview --copies` | Group repos that are copies of each other (same origin / root commit) and judge which copies are **safe to delete** vs hold unique work. |
 | `git-map` | Render all repos as an SVG "subway map" — folders as spines, repos as stations coloured by account, status as fill, copies as interchanges. |
-| `git-tui` | Interactive terminal browser of the repo tree; drill into any repo (`→`) for per-branch timelines and a scrollable commit log. |
+| `git-tui` | Interactive terminal browser of the repo tree; drill into any repo (`→`) for a colour-coded **commit DAG** (git topology drawn as a subway-style map) showing forks, merges, dead-end branches, and which commits are unpushed. |
 
 ## Install
 
@@ -51,8 +51,10 @@ Tree: `j/k` move · `l/h` expand/collapse · `z` collapse-all · `d`/`u`/`x`/`a`
 filter dirty/unpushed/copies/all · `c` next copy · `?` legend · `r` rescan ·
 `o` print selected path & quit · `q` quit.
 
-Drill-down (`→`/Enter on a repo): per-branch timelines + commit log;
-`j/k` hop branch · `PgUp/PgDn`/`g/G` scroll commits · `?` legend · `h/←/q` back.
+Drill-down (`→`/Enter on a repo): the commit DAG (git topology) rendered as a
+coloured map — lanes coloured per column, `●` pushed / `◆` unpushed nodes,
+`[refs]` for branch/tag tips. `j/k` scroll · `PgUp/PgDn`/`g/G` page · `?` legend
+· `h/←/q` back.
 
 ## Status encoding
 

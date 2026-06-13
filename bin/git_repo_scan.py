@@ -118,8 +118,33 @@ def _parse_commits(raw, pushed):
                         rel=cr, refs=refs, subj=subj, pushed=sha in pushed))
     return out
 
-def repo_detail(repo, per_branch=400, max_branches=24):
-    """Branches, each with its own commit list (pushed flag) for the drill-down."""
+def repo_graph(repo, limit=600):
+    """Parse `git log --graph` into styled lines for the commit-DAG view.
+
+    Returns a list of dicts:
+      {kind:'c', art, sha, ct, rel, refs, subj, pushed}   commit rows
+      {kind:'l', art}                                      link/rail rows
+    The `art` is git's own topology art (* | / \\ _) — column 2*L == lane L.
+    """
+    pushed = set(git(repo, "rev-list", "--remotes").split())
+    US = "\x1f"   # unit separator: legal in argv (unlike NUL), absent from commit text
+    raw = git(repo, "log", "--branches", "--remotes", "--date-order", "--graph",
+              f"--format={US}%H{US}%ct{US}%cr{US}%D{US}%s", "-n", str(limit))
+    out = []
+    for ln in raw.split("\n"):
+        if US in ln:
+            art, rest = ln.split(US, 1)
+            f = (rest.split(US) + [""] * 5)[:5]
+            h, ct, cr, refs, subj = f
+            out.append(dict(kind="c", art=art, sha=h[:8],
+                            ct=int(ct) if ct.isdigit() else 0, rel=cr,
+                            refs=refs, subj=subj, pushed=(h in pushed)))
+        elif ln.strip():
+            out.append(dict(kind="l", art=ln))
+    return out
+
+def repo_detail(repo, per_branch=400, max_branches=24, with_commits=True):
+    """Branches (optionally each with its commit list) for the drill-down."""
     # NB: don't use %(HEAD) as a parse field — git renders it inconsistently
     # ("*" / " " / "" for non-current refs), which corrupts tab-splitting.
     cur = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
@@ -148,10 +173,11 @@ def repo_detail(repo, per_branch=400, max_branches=24):
     branches = branches[:max_branches]
 
     pushed = set(git(repo, "rev-list", "--remotes").split())
-    for b in branches:
-        raw = git(repo, "log", b["name"], "--date-order",
-                  "--format=%H\t%ct\t%cr\t%D\t%s", "-n", str(per_branch))
-        b["commits"] = _parse_commits(raw, pushed)
+    if with_commits:
+        for b in branches:
+            raw = git(repo, "log", b["name"], "--date-order",
+                      "--format=%H\t%ct\t%cr\t%D\t%s", "-n", str(per_branch))
+            b["commits"] = _parse_commits(raw, pushed)
 
     u = git(repo, "rev-list", "--count", "--branches", "--not", "--remotes")
     n_unpushed = int(u) if u.isdigit() else 0
