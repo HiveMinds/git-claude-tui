@@ -4,8 +4,11 @@ import os, subprocess
 PRUNE = {"node_modules", ".cache", ".direnv", ".venv", "venv"}
 
 def git(repo, *args):
+    # core.fileMode=false: ignore the executable bit everywhere, so chmod-only
+    # changes don't show up as "old mode/new mode" noise in diffs or as phantom
+    # modified files in status.
     try:
-        r = subprocess.run(["git", "-C", repo, *args],
+        r = subprocess.run(["git", "-C", repo, "-c", "core.fileMode=false", *args],
                            capture_output=True, text=True, timeout=30)
         return r.stdout.strip()
     except Exception:
